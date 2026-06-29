@@ -1563,7 +1563,7 @@ def run_export_transits(db_path, exports_folder):
             return full_smoothed_depth, outlier_count
         return data[~outliers], outlier_count
 
-    def detect_jumps(group, window=10, abs_threshold=None, rel_threshold=0.01, min_depth=2.0):
+    def detect_jumps(group, window=5, abs_threshold=None, rel_threshold=0.10, min_depth=2.0):
         """
         Bilateral median spike detector.
 
@@ -1573,79 +1573,101 @@ def run_export_transits(db_path, exports_folder):
         while catching spike-and-return sounder glitches (which are inconsistent
         with both sides).
 
+        IMPORTANT: depths may be negative (depth below surface as a negative
+        number) or positive depending on the vessel's convention.  All comparisons
+        are done on absolute depth magnitudes to avoid sign-related bugs.
+
         Parameters
         ----------
         group : DataFrame
             Transit group sorted by time, must contain a 'depth' column and an
             'Outlier' column that will be updated in-place.
         window : int
-            Number of non-NaN neighbours to look at on each side.  5 works well
-            for typical CSB ping rates; increase to 10-15 for noisy/sparse data.
+            Number of non-already-flagged neighbours to consider on each side.
+            5 works well for typical CSB ping rates; raise to 10-15 for sparser
+            or noisier transects.
         abs_threshold : float or None
             Minimum absolute depth difference (metres) required to flag a point.
-            If None, defaults to max(2.0, depth * 0.05) — same rule as the
-            GEBCO reference check so the two layers are consistent.
+            If None, defaults to max(5.0, |depth| * 0.05) -- 5% of water depth
+            with a 5 m floor, which is conservative enough for open ocean use.
         rel_threshold : float
-            Fractional deviation from the local median required to flag a point
-            (e.g. 0.10 = 10 %).  Both the absolute AND relative criteria must
-            be exceeded, which avoids noisy shallow-water false positives.
+            Fractional deviation from the local median (on absolute depth) required
+            to flag a point (e.g. 0.10 = 10 %).  Both the absolute AND relative
+            criteria must be exceeded simultaneously.
         min_depth : float
-            Points shallower than this (metres) are skipped — very shallow water
-            has naturally high depth variability so the detector is unreliable.
+            Minimum water depth (in absolute metres) below which points are
+            skipped.  Applies to |depth| so it works regardless of sign convention.
 
         Returns
         -------
         jump_count : int
             Number of newly flagged jump outliers.
         """
-        depths = group['depth'].values.astype(float)
+        # Work entirely on absolute depth magnitudes to be sign-convention agnostic.
+        raw_depths = group['depth'].values.astype(float)
+        depths = np.abs(raw_depths)          # always positive from here on
         n = len(depths)
         jump_flags = np.zeros(n, dtype=bool)
+
+        # Snapshot the outlier flags BEFORE this pass so we skip points already
+        # caught by the smoothing passes when building neighbour windows -- but we
+        # still EVALUATE those points as jump candidates (the smoothing may have
+        # flagged them for a different reason, or been too aggressive).
+        pre_pass_flagged = group['Outlier'].values.copy()
 
         for i in range(n):
             d = depths[i]
             if np.isnan(d) or d < min_depth:
                 continue
 
-            # Collect up to `window` valid (non-NaN, non-already-flagged) neighbours
-            # on each side, skipping points already flagged by the smoothing passes.
-            already_flagged = group['Outlier'].values
-
+            # Collect up to `window` unflagged neighbours on each side.
+            # Using pre_pass_flagged means we don't skip points that THIS
+            # pass just flagged moments ago (avoids cascading suppression).
             back_vals = []
             j = i - 1
             while j >= 0 and len(back_vals) < window:
-                if not np.isnan(depths[j]) and not already_flagged[j]:
+                if not np.isnan(depths[j]) and not pre_pass_flagged[j]:
                     back_vals.append(depths[j])
                 j -= 1
 
             fwd_vals = []
             j = i + 1
             while j < n and len(fwd_vals) < window:
-                if not np.isnan(depths[j]) and not already_flagged[j]:
+                if not np.isnan(depths[j]) and not pre_pass_flagged[j]:
                     fwd_vals.append(depths[j])
                 j += 1
 
-            # Need at least 2 neighbours on each side for a reliable median
+            # Need at least 2 neighbours on each side for a reliable median.
             if len(back_vals) < 2 or len(fwd_vals) < 2:
                 continue
 
-            back_med = np.median(back_vals)
+            back_med = np.median(back_vals)   # absolute depth median
             fwd_med  = np.median(fwd_vals)
-
-            # Dynamic absolute threshold (mirrors GEBCO logic)
-            if abs_threshold is None:
-                thr = max(2.0, d * 0.05)
-            else:
-                thr = abs_threshold
 
             dev_back = abs(d - back_med)
             dev_fwd  = abs(d - fwd_med)
 
-            # Flag only when the point is an outlier relative to BOTH sides
-            # (absolute AND relative criteria must both be met)
+            # Base the absolute threshold on the NEIGHBOURHOOD median depth,
+            # not the candidate point itself.  This matters for deep-water glitches:
+            # a sounder dropout at 2000m produces a near-zero point, so using
+            # d * 0.05 would give a tiny threshold (~0m) that happens to pass,
+            # but using the neighbourhood median (2000m * 0.05 = 100m) correctly
+            # represents "how much variation is plausible at this water depth".
+            # We use the smaller of the two medians to be conservative (flag more).
+            local_ref_depth = min(back_med, fwd_med)
+            if abs_threshold is None:
+                thr = max(5.0, local_ref_depth * 0.05)
+            else:
+                thr = abs_threshold
+
+            # Relative deviations computed on absolute medians (always > 0).
+            rel_back = dev_back / max(back_med, 1e-6)
+            rel_fwd  = dev_fwd  / max(fwd_med,  1e-6)
+
+            # Flag only when the point is anomalous relative to BOTH sides
+            # (absolute AND relative criteria must both be met on each side).
             if (dev_back > thr and dev_fwd > thr and
-                    dev_back / max(abs(back_med), 1e-6) > rel_threshold and
-                    dev_fwd  / max(abs(fwd_med),  1e-6) > rel_threshold):
+                    rel_back > rel_threshold and rel_fwd > rel_threshold):
                 jump_flags[i] = True
 
         # Apply flags back to the group DataFrame
@@ -1653,6 +1675,7 @@ def run_export_transits(db_path, exports_folder):
         group.loc[jump_indices, 'Outlier'] = True
         jump_count = int(jump_flags.sum())
         return jump_count
+
 
     def create_geotiff(gdf, filename, resolution=8):
         try:
@@ -1774,32 +1797,40 @@ def run_export_transits(db_path, exports_folder):
                 print(f"    Outliers detected in Pass 3: {outlier_count_3}")
                 group['Final_Smoothed_Depth'] = final_smoothed_depth
 
-                # --- Jump / spike detector (bilateral median) ---
+                # --- Jump/spike detector (bilateral median) ---
                 # Runs after the smoothing passes so it can skip already-flagged
                 # points when computing local medians.  Track which indices were
                 # newly flagged so the plot can distinguish detection mechanisms.
                 pre_jump_outlier_mask = group['Outlier'].copy()
                 print("    Jump Detection Pass (bilateral median):")
-                jump_count = detect_jumps(group, window=10, rel_threshold=0.01)
+                jump_count = detect_jumps(group, window=5, rel_threshold=0.10)
                 print(f"    Jump outliers detected: {jump_count}")
                 # Mask of points flagged ONLY by the jump detector (not smoothing)
                 jump_only_mask = (group['Outlier'] == True) & (pre_jump_outlier_mask == False)
 
                 plot_filename = os.path.join(exports_folder, f"{unique_id}_{transit_id}_outlier_plot.png")
-                fig, ax = plt.subplots(figsize=(12, 6))
-                mask_valid        = group['Outlier'] == False
+                fig, ax = plt.subplots(figsize=(14, 6))
+                mask_valid          = group['Outlier'] == False
                 mask_smooth_outlier = (group['Outlier'] == True) & ~jump_only_mask
-                ax.scatter(group.index[mask_valid], group.loc[mask_valid, 'depth'],
+                # Parse time column to datetime if it isn't already, then use as x-axis
+                # so the plot shows real temporal spacing between pings.
+                try:
+                    time_vals = pd.to_datetime(group['time'])
+                except Exception:
+                    time_vals = group.index   # fallback to record index if time parse fails
+                ax.scatter(time_vals[mask_valid], group.loc[mask_valid, 'depth'],
                            color='blue', s=1, label="Valid")
-                ax.scatter(group.index[mask_smooth_outlier], group.loc[mask_smooth_outlier, 'depth'],
+                ax.scatter(time_vals[mask_smooth_outlier], group.loc[mask_smooth_outlier, 'depth'],
                            color='red', s=10, label="Smoothing Outlier")
-                ax.scatter(group.index[jump_only_mask], group.loc[jump_only_mask, 'depth'],
+                ax.scatter(time_vals[jump_only_mask], group.loc[jump_only_mask, 'depth'],
                            color='orange', s=15, marker='^', label="Jump Outlier")
                 ax.set_title(f"Outlier Detection for Transit {transit_id} (unique_id: {unique_id})")
-                ax.set_xlabel("Record Index")
-                ax.set_ylabel("Depth")
+                ax.set_xlabel("Time")
+                ax.set_ylabel("Depth (m)")
                 ax.legend()
-                plt.savefig(plot_filename)
+                fig.autofmt_xdate(rotation=30, ha='right')
+                plt.tight_layout()
+                plt.savefig(plot_filename, dpi=150)
                 plt.close()
                 print(f"    Saved outlier plot to {plot_filename}")
 

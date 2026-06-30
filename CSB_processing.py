@@ -117,7 +117,7 @@ def loadCSB():
     df = df.dropna(subset=['time', 'depth'])
     
     # Filter rows based on depth criteria
-    df = df[(df['depth'] > 0.5) & (df['depth'] < 11000)]
+    df = df[(df['depth'] > 420) & (df['depth'] < 11000)]
     
     # Define time bounds and filter by time
     lower_bound = pd.to_datetime("2014")
@@ -2078,6 +2078,7 @@ def run_final_gridding_and_export():
                     FROM csb
                     WHERE (lat BETWEEN {miny} AND {maxy} AND lon BETWEEN {minx} AND {maxx})
                     AND (Raster_Value IS NULL OR ABS(Raster_Value - depth_mod) <= (uncertainty_vert * 100))
+                    AND "Outlier" = FALSE
                 """
                 df_points = con.execute(query).df()
 
@@ -2135,15 +2136,19 @@ def run_final_gridding_and_export():
             print("No tessellation scheme provided. Processing all data into a single file.")
             # Include all points regardless of reference coverage; has_reference
             # column lets downstream filtering and the GeoPackage distinguish them.
+            # Include all points regardless of reference coverage; has_reference
+            # column lets downstream filtering and the GeoPackage distinguish them.
             query = """
                 SELECT lat, lon, "Outlier" AS outlier, depth_mod AS depth, unique_id,
                 platform_name_x as platform_name, time, uncertainty_vert,
                 has_reference
                 FROM csb
                 WHERE
-                    Raster_Value IS NULL
+                    "Outlier" = FALSE
+                    AND
+                    (Raster_Value IS NULL
                     OR
-                    ABS(Raster_Value - depth_mod) <= (uncertainty_vert * 100)
+                    ABS(Raster_Value - depth_mod) <= (uncertainty_vert * 100))
             """
             df_points = con.execute(query).df()
 

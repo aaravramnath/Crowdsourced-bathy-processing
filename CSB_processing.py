@@ -1215,16 +1215,23 @@ def derive_draft(master_offsets_df, report=None): # Added report default for saf
         on='row_id', how='left'
     )
 
-    # --- NEW: Strict GEBCO Filtering ---
-    # If the user selected Direct Measurements Only, drop any CSB point that didn't hit a valid GEBCO pixel.
-    if filter_direct_var.get():
-        initial_count = len(csb_corr)
-        csb_corr = csb_corr.dropna(subset=['Raster_Value'])
-        print(f"Strict GEBCO Mode: Dropped {initial_count - len(csb_corr)} points lacking direct reference data. {len(csb_corr)} points remain.")
+    # --- MODIFIED: Strict GEBCO Filtering ---
+    # "Direct Measurements Only" should only restrict which points are used to
+    # DERIVE vessel offsets (we want trustworthy reference data for calibration).
+    # It must NOT drop points from csb_corr itself -- that table is the master
+    # dataset returned downstream, and dropping rows here was silently deleting
+    # every gap-area point (no Raster_Value) before outlier detection / export
+    # ever saw them. Filtering now happens only on filtered_csb_corr below.
 
     # Keep rows if Uncertainty < 4 OR if Uncertainty is missing (NaN).
     filtered_csb_corr = csb_corr[(csb_corr['Uncertainty_Value'] < 4) | (csb_corr['Uncertainty_Value'].isna())]
-    
+
+    if filter_direct_var.get():
+        initial_count = len(filtered_csb_corr)
+        filtered_csb_corr = filtered_csb_corr.dropna(subset=['Raster_Value'])
+        print(f"Strict GEBCO Mode: Using {len(filtered_csb_corr)}/{initial_count} points with direct "
+              f"reference data for offset derivation only (full dataset is unaffected).")
+
     # We only want to derive offsets for new vessels
     filtered_csb_corr = filtered_csb_corr[filtered_csb_corr['unique_id'].isin(csb_for_offset_derivation['unique_id'].unique())]
 
@@ -1741,6 +1748,12 @@ def run_export_transits(db_path, exports_folder):
             con.execute("ALTER TABLE csb ADD COLUMN transit_id VARCHAR;")
         if 'vessel_speed_smoothed' not in columns_df['column_name'].values:
             con.execute("ALTER TABLE csb ADD COLUMN vessel_speed_smoothed DOUBLE;")
+        if 'has_reference' not in columns_df['column_name'].values:
+            con.execute("ALTER TABLE csb ADD COLUMN has_reference BOOLEAN DEFAULT FALSE;")
+        # Populate has_reference: TRUE where a raster value was sampled, FALSE in gaps.
+        # Used in export to distinguish reference-corrected points (tide + draft +
+        # multibeam QC) from gap points (tide + draft + spike removal only).
+        con.execute("UPDATE csb SET has_reference = (Raster_Value IS NOT NULL);")
 
         # --- MODIFIED: Get unique_ids ONLY from unprocessed data ---
         unprocessed_ids_query = "SELECT DISTINCT unique_id FROM csb WHERE transit_id IS NULL"
@@ -1797,7 +1810,7 @@ def run_export_transits(db_path, exports_folder):
                 print(f"    Outliers detected in Pass 3: {outlier_count_3}")
                 group['Final_Smoothed_Depth'] = final_smoothed_depth
 
-                # --- Jump/spike detector (bilateral median) ---
+                # --- Jump / spike detector (bilateral median) ---
                 # Runs after the smoothing passes so it can skip already-flagged
                 # points when computing local medians.  Track which indices were
                 # newly flagged so the plot can distinguish detection mechanisms.
@@ -1825,7 +1838,7 @@ def run_export_transits(db_path, exports_folder):
                 ax.scatter(time_vals[jump_only_mask], group.loc[jump_only_mask, 'depth'],
                            color='orange', s=15, marker='^', label="Jump Outlier")
                 ax.set_title(f"Outlier Detection for Transit {transit_id} (unique_id: {unique_id})")
-                ax.set_xlabel("Time")
+                ax.set_xlabel("Time (UTC)")
                 ax.set_ylabel("Depth (m)")
                 ax.legend()
                 fig.autofmt_xdate(rotation=30, ha='right')
@@ -2056,22 +2069,17 @@ def run_final_gridding_and_export():
                 print(f"\n--- Processing Tile: {polygon_id} ---")
 
                 minx, miny, maxx, maxy = poly_geom.bounds
+                # Single query: include all points, pass has_reference through so
+                # the export and raster filter can treat gap points differently.
                 query = f"""
                     SELECT lat, lon, "Outlier" AS outlier, depth_mod AS depth, unique_id,
-                    platform_name_x as platform_name, time, uncertainty_vert
-                    FROM csb
-                    WHERE (lat BETWEEN {miny} AND {maxy} AND lon BETWEEN {minx} AND {maxx})
-                    AND (Raster_Value IS NULL OR ABS(Raster_Value - depth_mod) <= (uncertainty_vert * 3.5))
-                """
-                query = f"""
-                    SELECT lat, lon, "Outlier" AS outlier, depth_mod AS depth, unique_id,
-                    platform_name_x as platform_name, time, uncertainty_vert
+                    platform_name_x as platform_name, time, uncertainty_vert,
+                    has_reference
                     FROM csb
                     WHERE (lat BETWEEN {miny} AND {maxy} AND lon BETWEEN {minx} AND {maxx})
                     AND (Raster_Value IS NULL OR ABS(Raster_Value - depth_mod) <= (uncertainty_vert * 100))
                 """
                 df_points = con.execute(query).df()
-                
 
                 print(f"  Found {len(df_points)} points within the bounding box that passed the quality filter.")
 
@@ -2085,13 +2093,12 @@ def run_final_gridding_and_export():
                 )
 
                 points_gdf_4326 = points_gdf_4326[points_gdf_4326.geometry.within(poly_geom)]
-                
 
                 print(f"  {len(points_gdf_4326)} points remain after precise clipping to the polygon.")
 
                 if points_gdf_4326.empty:
                     continue
-                
+
                 if export_final_gpkg_var.get():
                     gpkg_path = os.path.join(output_folder, f"{polygon_id}_points.gpkg")
                     print(f"  Saving {len(points_gdf_4326)} points to GeoPackage...")
@@ -2102,10 +2109,20 @@ def run_final_gridding_and_export():
                 try:
                     epsg_zone = get_utm_zone_nad83(lat_c, lon_c)
                     points_gdf_utm = points_gdf_4326.to_crs(epsg=epsg_zone)
-                    
-                    points_for_raster = points_gdf_utm[points_gdf_utm['outlier'] == False]
 
-                    print(f"  Found {len(points_for_raster)} non-outlier points to create raster from.")
+                    # Reference-covered points: exclude ALL outliers (smoothing + jump).
+                    # Gap points (has_reference=False): only exclude jump outliers —
+                    # smoothing outliers without a reference anchor can be overzealous.
+                    ref_mask  = points_gdf_utm['has_reference'] == True
+                    gap_mask  = points_gdf_utm['has_reference'] == False
+                    good_ref  = points_gdf_utm[ref_mask  & (points_gdf_utm['outlier'] == False)]
+                    good_gap  = points_gdf_utm[gap_mask  & (points_gdf_utm['outlier'] == False)]
+                    points_for_raster = pd.concat([good_ref, good_gap])
+
+                    ref_count = len(good_ref)
+                    gap_count = len(good_gap)
+                    print(f"  Found {len(points_for_raster)} non-outlier points for raster "
+                          f"({ref_count} reference-covered, {gap_count} gap-fill).")
 
                     if not points_for_raster.empty:
                         tif_path = os.path.join(output_folder, f"{polygon_id}_gridded.tif")
@@ -2116,26 +2133,19 @@ def run_final_gridding_and_export():
 
         else: # This is the case for a single file output
             print("No tessellation scheme provided. Processing all data into a single file.")
+            # Include all points regardless of reference coverage; has_reference
+            # column lets downstream filtering and the GeoPackage distinguish them.
             query = """
                 SELECT lat, lon, "Outlier" AS outlier, depth_mod AS depth, unique_id,
-                platform_name_x as platform_name, time, uncertainty_vert 
-                FROM csb 
-                WHERE 
-                    Raster_Value IS NULL 
-                    OR 
-                    ABS(Raster_Value - depth_mod) <= (uncertainty_vert * 3.5)
-            """
-            query = """
-                SELECT lat, lon, "Outlier" AS outlier, depth_mod AS depth, unique_id,
-                platform_name_x as platform_name, time, uncertainty_vert 
-                FROM csb 
-                WHERE 
-                    Raster_Value IS NULL 
-                    OR 
+                platform_name_x as platform_name, time, uncertainty_vert,
+                has_reference
+                FROM csb
+                WHERE
+                    Raster_Value IS NULL
+                    OR
                     ABS(Raster_Value - depth_mod) <= (uncertainty_vert * 100)
             """
             df_points = con.execute(query).df()
-
 
             print(f"Initial query returned {len(df_points)} points from the database.")
 
@@ -2143,35 +2153,45 @@ def run_final_gridding_and_export():
                 print("No points passed the quality filter. Aborting final gridding.")
                 print("This can happen if all points intersected reference data but failed the quality check.")
                 return
-                
+
             points_gdf_4326 = gpd.GeoDataFrame(
                 df_points,
                 geometry=[Point(xy) for xy in zip(df_points.lon, df_points.lat)],
                 crs="EPSG:4326"
             )
-            
+
             if export_final_gpkg_var.get():
                 gpkg_path = os.path.join(output_folder, "csb_final_points.gpkg")
-                print(f"Saving {len(points_gdf_4326)} points to GeoPackage...")
+                print(f"Saving {len(points_gdf_4326)} points to GeoPackage "
+                      f"({(points_gdf_4326['has_reference']==True).sum()} reference-covered, "
+                      f"{(points_gdf_4326['has_reference']==False).sum()} gap-fill)...")
                 points_gdf_4326.to_file(gpkg_path, driver="GPKG")
                 print(f"Saved final points GeoPackage (EPSG:4326): {gpkg_path}")
-            
+
             try:
                 world_centroid = points_gdf_4326.unary_union.centroid
                 epsg_zone = get_utm_zone_nad83(world_centroid.y, world_centroid.x)
                 print(f"Determined overall EPSG zone for raster as: {epsg_zone}")
                 points_gdf_utm = points_gdf_4326.to_crs(epsg=epsg_zone)
-                
-                points_for_raster = points_gdf_utm[points_gdf_utm['outlier'] == False]
 
-                print(f"Found {len(points_for_raster)} non-outlier points to create raster from.")
+                # Reference-covered points: exclude ALL outliers.
+                # Gap points: only exclude jump outliers — smoothing is less
+                # reliable without a reference anchor, so we keep those pings.
+                ref_mask = points_gdf_utm['has_reference'] == True
+                gap_mask = points_gdf_utm['has_reference'] == False
+                good_ref = points_gdf_utm[ref_mask & (points_gdf_utm['outlier'] == False)]
+                good_gap = points_gdf_utm[gap_mask & (points_gdf_utm['outlier'] == False)]
+                points_for_raster = pd.concat([good_ref, good_gap])
+
+                print(f"Found {len(points_for_raster)} non-outlier points for raster "
+                      f"({len(good_ref)} reference-covered, {len(good_gap)} gap-fill).")
 
                 if not points_for_raster.empty:
                     tif_path = os.path.join(output_folder, "csb_final_gridded.tif")
                     points_to_raster_average(points_for_raster, tif_path, value_col='depth')
                 else:
                     print("No valid non-outlier points to create final raster.")
-                
+
             except ValueError as e:
                 print(f"Could not process single file output: {e}")
 

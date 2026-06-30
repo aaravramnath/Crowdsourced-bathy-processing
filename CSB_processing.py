@@ -117,7 +117,7 @@ def loadCSB():
     df = df.dropna(subset=['time', 'depth'])
     
     # Filter rows based on depth criteria
-    df = df[(df['depth'] > 420) & (df['depth'] < 11000)]
+    df = df[(df['depth'] > 600) & (df['depth'] < 11000)]
     
     # Define time bounds and filter by time
     lower_bound = pd.to_datetime("2014")

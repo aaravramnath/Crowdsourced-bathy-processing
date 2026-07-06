@@ -64,6 +64,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 TRANSIT_GAP_MINUTES = 60
 
 # Vessel offset limits: offsets outside this range are considered unreliable
+# and the vessel gets no correction (falls back to raw depth).
 OFFSET_MIN_M = -11.0   # don't correct by more than 11 m shallow
 OFFSET_MAX_M =  3.0    # don't correct by more than 3 m deep
 OFFSET_MIN_STD_M = 7.0 # discard offset if std dev of diffs exceeds this
@@ -91,14 +92,24 @@ SMOOTH_PERCENTILE  = 98    # flag residuals above this percentile
 DIRECT_TID_VALUES = set(range(10, 18))
 
 
+# Load CSV + premliminary sanity checks
+
 def load_csb(csv_path: str) -> gpd.GeoDataFrame:
     print(f"[1/5] Loading CSB CSV: {csv_path}")
     df = pd.read_csv(csv_path)
 
-    required = {"unique_id", "platform_name", "time", "lat", "lon", "depth"}
+    required = {"time", "lat", "lon", "depth"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"CSV is missing required columns: {missing}")
+
+    # Optional columns — fill with fallbacks if absent
+    if "unique_id" not in df.columns:
+        print("    [info] 'unique_id' column not found — treating all data as one vessel")
+        df["unique_id"] = "unknown_vessel"
+    if "platform_name" not in df.columns:
+        print("    [info] 'platform_name' column not found — setting to 'unknown'")
+        df["platform_name"] = "unknown"
 
     df["depth"] = pd.to_numeric(df["depth"], errors="coerce")
     df["lat"]   = pd.to_numeric(df["lat"],   errors="coerce")
@@ -505,12 +516,11 @@ def export_gpkg(gdf: gpd.GeoDataFrame, out_path: str) -> None:
 # Main method
 
 def main():
-    # ── CONFIG — edit these paths before hitting Run ──────────────────────
+    # Paths are preset, modify to fit your files
     CSV_PATH    = r"data.csv"
     RASTER_PATH = r"gebco_bathymetry.tif"
     TID_PATH    = r"gebco_tid.tif"   # set to None to disable TID filter
     OUT_DIR     = r"output"
-    # ─────────────────────────────────────────────────────────────────────
 
     out_dir    = OUT_DIR
     plots_dir  = os.path.join(out_dir, "outlier_plots")

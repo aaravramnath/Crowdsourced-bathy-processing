@@ -58,7 +58,7 @@ print(f"Valid points remaining for math: {len(predicted_gdf)}")
 
 
 # If GEBCO is negative and CSB is positive, uncomment the next line:
-predicted_gdf['gebco_depth'] = predicted_gdf['gebco_depth'] * -1
+# predicted_gdf['gebco_depth'] = predicted_gdf['gebco_depth'] * -1
 
 predicted_gdf['difference'] = predicted_gdf[depth_col] - predicted_gdf['gebco_depth']
 
@@ -82,8 +82,6 @@ gebco_array = predicted_gdf['gebco_depth'].values
 diff_array = predicted_gdf['difference'].values
 
 mean_error = np.mean(diff_array)
-mae = mean_absolute_error(gebco_array, csb_array)
-rmse = np.sqrt(mean_squared_error(gebco_array, csb_array))
 std_dev = np.std(diff_array)
 
 
@@ -95,13 +93,11 @@ else:
 
 ci_95 = stats.norm.interval(0.95, loc=mean_error, scale=std_dev/np.sqrt(len(diff_array)))
 
-print("\n--- Statistical Analysis Results (Predicted Grid Only) ---")
+print("\nStatistical Analysis")
 print(f"Mean Difference (Bias): {mean_error:.3f} meters")
-print(f"Mean Absolute Error (MAE): {mae:.3f} meters")
-print(f"Root Mean Square Error (RMSE): {rmse:.3f} meters")
 print(f"Standard Deviation of Diff: {std_dev:.3f} meters")
-print(f"Pearson Correlation (r): {r:.3f} (p-value: {p_value:.3e})")
-print(f"95% Confidence Interval of Mean Diff: {ci_95[0]:.3f} to {ci_95[1]:.3f} meters")
+print(f"R correlation: {r:.3f} (p-value: {p_value:.3e})")
+print(f"95% confidence interval of Mean Difference: {ci_95[0]:.3f} to {ci_95[1]:.3f} meters")
 
 output_gpkg = 'csb_vs_gebco_predicted.gpkg'
 predicted_gdf.to_file(output_gpkg, driver="GPKG")

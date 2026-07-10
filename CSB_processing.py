@@ -116,6 +116,8 @@ def load_csb(csv_path: str) -> gpd.GeoDataFrame:
     df["lon"]   = pd.to_numeric(df["lon"],   errors="coerce")
     df["time"]  = pd.to_datetime(df["time"],  errors="coerce")
 
+    df['depth'] = df['depth'].abs()  # ensure positive depth values
+
     before = len(df)
     df = df.dropna(subset=["time", "depth", "lat", "lon", "unique_id"])
     df = df[(df["depth"] > 0.5) & (df["depth"] < 11000)]
@@ -401,8 +403,8 @@ REASON_STYLE = {
     "smoothing_residual":       dict(color="#e9c46a", marker="o", s=12, zorder=4, label="Smoothing residual"),
     "valid":                    dict(color="#457b9d", marker="o", s=4,  zorder=3, label="Valid"),
 }
-
-
+ 
+ 
 def plot_transit(grp: pd.DataFrame, transit_id: str, out_path: str) -> None:
     fig, axes = plt.subplots(2, 1, figsize=(14, 8), sharex=True,
                              gridspec_kw={"height_ratios": [3, 1]})
@@ -414,104 +416,97 @@ def plot_transit(grp: pd.DataFrame, transit_id: str, out_path: str) -> None:
         ax.yaxis.label.set_color("#c9d1d9")
         for spine in ax.spines.values():
             spine.set_edgecolor("#30363d")
-
+ 
     times = pd.to_datetime(grp["time"])
-
-    # top panel
+ 
+    # Negate for convention
+    depth_display  = -grp["depth_corr"]
+    raster_display = -grp["raster_val"]
+ 
     ax = axes[0]
-
-    # Valid points
+ 
     valid = grp[~grp["outlier"]]
     if not valid.empty:
-        ax.scatter(times[valid.index], valid["depth_corr"],
+        ax.scatter(times[valid.index], depth_display[valid.index],
                    **{**REASON_STYLE["valid"], "label": "Valid"})
-
-    # Reference raster line where available
-    ref = grp[grp["has_reference"] & ~grp["outlier"]]
+ 
+    # Reference raster — one white dot per point that has a value
+    ref = grp[grp["has_reference"]]
     if not ref.empty:
-        ref_sorted = ref.sort_values("time")
-        ax.plot(pd.to_datetime(ref_sorted["time"]), ref_sorted["raster_val"],
-                color="#2ec4b6", linewidth=0.8, alpha=0.6, zorder=2,
-                label="Reference raster")
-
+        ax.scatter(times[ref.index], raster_display[ref.index],
+                   color="white", s=6, marker="o", alpha=0.7, zorder=2,
+                   label="Reference raster")
+ 
     # Flagged points by reason
     for reason, style in REASON_STYLE.items():
         if reason == "valid":
             continue
         sub = grp[grp["outlier"] & (grp["outlier_reason"] == reason)]
         if not sub.empty:
-            ax.scatter(times[sub.index], sub["depth_corr"], **style)
-
-    ax.set_ylabel("Depth (m, positive down)", fontsize=9)
-    ax.set_title(f"{transit_id}", color="#c9d1d9", fontsize=10, pad=6)
-    ax.invert_yaxis()
+            ax.scatter(times[sub.index], depth_display[sub.index], **style)
+ 
+    ax.set_ylabel("Depth (m, negative down)", fontsize=9, color="#c9d1d9")
+    ax.set_title(transit_id, color="#c9d1d9", fontsize=10, pad=6)
     ax.legend(loc="lower left", fontsize=7, framealpha=0.3,
               labelcolor="#c9d1d9", facecolor="#161b22")
-
-    # bottom panel: outlier reason strip
+ 
     ax2 = axes[1]
-    reason_map = {"": 0, "hard_reference_deviation": 3,
-                  "bilateral_spike": 2, "smoothing_residual": 1}
-    colours_map = {"": "#457b9d", "hard_reference_deviation": "#e63946",
-                   "bilateral_spike": "#f4a261", "smoothing_residual": "#e9c46a"}
-    y_vals   = grp["outlier_reason"].map(reason_map).fillna(0)
-    c_vals   = grp["outlier_reason"].map(colours_map).fillna("#457b9d")
+    reason_map   = {"": 0, "hard_reference_deviation": 3, "bilateral_spike": 2, "smoothing_residual": 1}
+    colours_map  = {"": "#457b9d", "hard_reference_deviation": "#e63946",
+                    "bilateral_spike": "#f4a261", "smoothing_residual": "#e9c46a"}
+    y_vals = grp["outlier_reason"].map(reason_map).fillna(0)
+    c_vals = grp["outlier_reason"].map(colours_map).fillna("#457b9d")
     ax2.scatter(times, y_vals, c=c_vals, s=6, zorder=3)
     ax2.set_yticks([0, 1, 2, 3])
-    ax2.set_yticklabels(["Valid", "Smooth", "Spike", "Hard ref"],
-                        fontsize=7, color="#c9d1d9")
-    ax2.set_ylabel("Flag type", fontsize=8)
+    ax2.set_yticklabels(["Valid", "Smooth", "Spike", "Hard ref"], fontsize=7, color="#c9d1d9")
+    ax2.set_ylabel("Flag type", fontsize=8, color="#c9d1d9")
     ax2.set_xlabel("Time (UTC)", fontsize=9)
-
+ 
     fig.autofmt_xdate(rotation=25, ha="right")
-    plt.tight_layout(rect=[0, 0, 1, 1])
-
+    plt.tight_layout()
     plt.savefig(out_path, dpi=140, facecolor=fig.get_facecolor())
     plt.close(fig)
-
-
+  
 def export_plots(gdf: gpd.GeoDataFrame, plots_dir: str) -> None:
     os.makedirs(plots_dir, exist_ok=True)
     transits = gdf["transit_id"].unique()
     print(f"  Exporting {len(transits)} transit plots → {plots_dir}")
     for tid in transits:
-        grp = gdf[gdf["transit_id"] == tid].sort_values("time").copy()
-        grp = grp.reset_index()   # keep original index in column
+        grp = gdf[gdf["transit_id"] == tid].sort_values("time").copy().reset_index()
         safe_tid = tid.replace("/", "_").replace(":", "-")
-        out_path = os.path.join(plots_dir, f"{safe_tid}.png")
         try:
-            plot_transit(grp, tid, out_path)
+            plot_transit(grp, tid, os.path.join(plots_dir, f"{safe_tid}.png"))
         except Exception as e:
             print(f"    [warn] could not plot {tid}: {e}")
-
-
-# Export Products
-
+ 
+ 
 EXPORT_COLS = [
     "unique_id", "platform_name", "time",
     "lat", "lon",
-    "depth_raw", "depth_corr",
-    "raster_val",
-    "vessel_offset",
-    "has_reference",
+    "depth_raw", "depth_corr", "raster_val",
+    "vessel_offset", "has_reference",
     "outlier", "outlier_reason",
-    "transit_id",
-    "geometry"
+    "transit_id", "geometry"
 ]
-
-
+ 
+ 
 def export_gpkg(gdf: gpd.GeoDataFrame, out_path: str) -> None:
     out = gdf[[c for c in EXPORT_COLS if c in gdf.columns]].copy()
+ 
+    # Make negatives for convention
+    out["depth_corr"] = -out["depth_corr"]
+    out["depth_raw"]  = -out["depth_raw"]
+    out["raster_val"] = -out["raster_val"]
+ 
     out["time"] = out["time"].astype(str)
     out.to_file(out_path, driver="GPKG")
+ 
     n_valid   = (~out["outlier"]).sum()
     n_flagged = out["outlier"].sum()
     print(f"  GeoPackage saved: {out_path}")
     print(f"  {n_valid:,} valid  |  {n_flagged:,} flagged as outlier")
-    by_reason = out[out["outlier"]]["outlier_reason"].value_counts()
-    for reason, count in by_reason.items():
+    for reason, count in out[out["outlier"]]["outlier_reason"].value_counts().items():
         print(f"    {reason}: {count:,}")
-
 
 # Main method
 
@@ -568,12 +563,13 @@ def main():
     print(f"[5/5] Running outlier detection")
     gdf = run_outlier_detection(gdf)
 
+
     # Export
     print(f"\nExporting results → {out_dir}")
     export_gpkg(gdf, gpkg_path)
     export_plots(gdf, plots_dir)
 
-    print("\nDone.")
+    print("\nFinished processing")
 
 
 if __name__ == "__main__":

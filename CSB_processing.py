@@ -94,28 +94,35 @@ DIRECT_TID_VALUES = set(range(10, 18))
 
 # Load CSV + premliminary sanity checks
 
-def load_csb(csv_path: str) -> gpd.GeoDataFrame:
-    print(f"[1/5] Loading CSB CSV: {csv_path}")
+def _parse_single_csv(csv_path: str) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
 
-    required = {"time", "lat", "lon", "depth"}
+    required = {"lat", "lon", "depth"}
     missing = required - set(df.columns)
     if missing:
-        raise ValueError(f"CSV is missing required columns: {missing}")
+        raise ValueError(f"{os.path.basename(csv_path)}: missing columns {missing}")
 
-    # Optional columns — fill with fallbacks if absent
+    # time parsing, prefer them split up into date and time columns but accept a single time column if present
+    date_col = next((c for c in df.columns if c.strip().lower().startswith("date")), None)
+    time_col = next((c for c in df.columns if c.strip().lower().startswith("time")), None)
+
+    if date_col and time_col and date_col != time_col:
+        combined = df[date_col].astype(str).str.strip() + " " + df[time_col].astype(str).str.strip()
+        df["time"] = pd.to_datetime(combined, dayfirst=True, errors="coerce")
+    elif "time" in df.columns:
+        df["time"] = pd.to_datetime(df["time"], dayfirst=True, errors="coerce")
+    else:
+        raise ValueError(f"{os.path.basename(csv_path)}: no time or date column found")
+
+    # optional cols
     if "unique_id" not in df.columns:
-        print("    [info] 'unique_id' column not found — treating all data as one vessel")
         df["unique_id"] = "unknown_vessel"
     if "platform_name" not in df.columns:
-        print("    [info] 'platform_name' column not found — setting to 'unknown'")
         df["platform_name"] = "unknown"
 
     df["depth"] = pd.to_numeric(df["depth"], errors="coerce")
     df["lat"]   = pd.to_numeric(df["lat"],   errors="coerce")
     df["lon"]   = pd.to_numeric(df["lon"],   errors="coerce")
-    df["time"]  = pd.to_datetime(df["time"],  errors="coerce")
-
     df['depth'] = df['depth'].abs()  # ensure positive depth values
 
     before = len(df)
@@ -123,16 +130,40 @@ def load_csb(csv_path: str) -> gpd.GeoDataFrame:
     df = df[(df["depth"] > 0.5) & (df["depth"] < 11000)]
     df = df[(df["lat"].between(-90, 90)) & (df["lon"].between(-180, 180))]
     df = df.drop_duplicates(subset=["lon", "lat", "depth", "time", "unique_id"])
+    dropped = before - len(df)
+    print(f"    {os.path.basename(csv_path)}: {len(df):,} rows ({dropped:,} dropped)")
+    return df
+
+
+def load_csb(csv_folder: str) -> gpd.GeoDataFrame:
+    csv_files = sorted(
+        p for p in Path(csv_folder).iterdir()
+        if p.suffix.lower() == ".csv"
+    )
+    if not csv_files:
+        raise FileNotFoundError(f"No CSV files found in: {csv_folder}")
+
+    print(f"[1/5] Loading {len(csv_files)} CSV file(s) from: {csv_folder}")
+
+    frames = []
+    for csv_path in csv_files:
+        try:
+            frames.append(_parse_single_csv(str(csv_path)))
+        except Exception as e:
+            print(f"    [warn] Skipping {csv_path.name}: {e}")
+
+    if not frames:
+        raise RuntimeError("All CSV files failed to load")
+
+    df = pd.concat(frames, ignore_index=True)
     df = df.sort_values(["unique_id", "time"]).reset_index(drop=True)
+    print(f"    Total: {len(df):,} rows across {len(frames)} file(s)")
 
-    print(f"    {len(df):,} rows loaded ({before - len(df):,} dropped during sanity checks)")
-
-    gdf = gpd.GeoDataFrame(
+    return gpd.GeoDataFrame(
         df,
         geometry=gpd.points_from_xy(df["lon"], df["lat"]),
         crs="EPSG:4326"
     )
-    return gdf
 
 
 # Reference Raster
@@ -140,12 +171,6 @@ def load_csb(csv_path: str) -> gpd.GeoDataFrame:
 def sample_raster(gdf: gpd.GeoDataFrame,
                   raster_path: str,
                   col_name: str) -> gpd.GeoDataFrame:
-    """
-    Sample a single-band raster at every point in gdf.
-    Returns gdf with a new column col_name (NaN where outside raster extent).
-    The raster is assumed to store depths as NEGATIVE values (GEBCO convention).
-    We store the absolute value so downstream code always works in positive metres.
-    """
     coords = [(geom.x, geom.y) for geom in gdf.geometry]
     with rasterio.open(raster_path) as src:
         nodata = src.nodata
@@ -158,8 +183,6 @@ def sample_raster(gdf: gpd.GeoDataFrame,
         values[np.isclose(values, nodata)] = np.nan
     values[values == 0] = np.nan   # zero depth is also invalid
 
-    # Convert from GEBCO negative convention → positive metres
-    # (if raster already stores positives this is a no-op since we abs())
     values = np.abs(values)
 
     gdf = gdf.copy()
@@ -406,35 +429,30 @@ REASON_STYLE = {
  
  
 def plot_transit(grp: pd.DataFrame, transit_id: str, out_path: str) -> None:
-    fig, axes = plt.subplots(2, 1, figsize=(14, 8), sharex=True,
-                             gridspec_kw={"height_ratios": [3, 1]})
-    fig.patch.set_facecolor("#0d1117")
-    for ax in axes:
-        ax.set_facecolor("#161b22")
-        ax.tick_params(colors="#c9d1d9")
-        ax.xaxis.label.set_color("#c9d1d9")
-        ax.yaxis.label.set_color("#c9d1d9")
-        for spine in ax.spines.values():
-            spine.set_edgecolor("#30363d")
+    fig, ax = plt.subplots(figsize=(14, 6))
+    fig.patch.set_facecolor("white")
+    ax.set_facecolor("white")
+    ax.tick_params(colors="black")
+    ax.xaxis.label.set_color("black")
+    ax.yaxis.label.set_color("black")
+    for spine in ax.spines.values():
+        spine.set_edgecolor("black")
  
     times = pd.to_datetime(grp["time"])
- 
-    # Negate for convention
     depth_display  = -grp["depth_corr"]
     raster_display = -grp["raster_val"]
  
-    ax = axes[0]
- 
+    # Valid points
     valid = grp[~grp["outlier"]]
     if not valid.empty:
         ax.scatter(times[valid.index], depth_display[valid.index],
                    **{**REASON_STYLE["valid"], "label": "Valid"})
  
-    # Reference raster — one white dot per point that has a value
+    # Reference raster — black dots
     ref = grp[grp["has_reference"]]
     if not ref.empty:
         ax.scatter(times[ref.index], raster_display[ref.index],
-                   color="white", s=6, marker="o", alpha=0.7, zorder=2,
+                   color="black", s=4, marker="o", zorder=2,
                    label="Reference raster")
  
     # Flagged points by reason
@@ -445,28 +463,15 @@ def plot_transit(grp: pd.DataFrame, transit_id: str, out_path: str) -> None:
         if not sub.empty:
             ax.scatter(times[sub.index], depth_display[sub.index], **style)
  
-    ax.set_ylabel("Depth (m, negative down)", fontsize=9, color="#c9d1d9")
-    ax.set_title(transit_id, color="#c9d1d9", fontsize=10, pad=6)
-    ax.legend(loc="lower left", fontsize=7, framealpha=0.3,
-              labelcolor="#c9d1d9", facecolor="#161b22")
- 
-    ax2 = axes[1]
-    reason_map   = {"": 0, "hard_reference_deviation": 3, "bilateral_spike": 2, "smoothing_residual": 1}
-    colours_map  = {"": "#457b9d", "hard_reference_deviation": "#e63946",
-                    "bilateral_spike": "#f4a261", "smoothing_residual": "#e9c46a"}
-    y_vals = grp["outlier_reason"].map(reason_map).fillna(0)
-    c_vals = grp["outlier_reason"].map(colours_map).fillna("#457b9d")
-    ax2.scatter(times, y_vals, c=c_vals, s=6, zorder=3)
-    ax2.set_yticks([0, 1, 2, 3])
-    ax2.set_yticklabels(["Valid", "Smooth", "Spike", "Hard ref"], fontsize=7, color="#c9d1d9")
-    ax2.set_ylabel("Flag type", fontsize=8, color="#c9d1d9")
-    ax2.set_xlabel("Time (UTC)", fontsize=9)
+    ax.set_ylabel("Depth (m)", fontsize=9)
+    ax.set_xlabel("Time", fontsize=9)
+    ax.set_title(transit_id, fontsize=10, pad=6)
+    ax.legend(loc="lower left", fontsize=7)
  
     fig.autofmt_xdate(rotation=25, ha="right")
     plt.tight_layout()
-    plt.savefig(out_path, dpi=140, facecolor=fig.get_facecolor())
+    plt.savefig(out_path, dpi=140, facecolor="white")
     plt.close(fig)
-  
 def export_plots(gdf: gpd.GeoDataFrame, plots_dir: str) -> None:
     os.makedirs(plots_dir, exist_ok=True)
     transits = gdf["transit_id"].unique()
@@ -511,10 +516,10 @@ def export_gpkg(gdf: gpd.GeoDataFrame, out_path: str) -> None:
 # Main method
 
 def main():
-    # Paths are preset, modify to fit your files
-    CSV_PATH    = r"data.csv"
+    # Edit these paths to point to your respective files/folders
+    CSV_FOLDER  = r"csv_data"           # folder with your csv files
     RASTER_PATH = r"gebco_bathymetry.tif"
-    TID_PATH    = r"gebco_tid.tif"   # set to None to disable TID filter
+    TID_PATH    = r"gebco_tid.tif"      # set to None to disable TID filter
     OUT_DIR     = r"output"
 
     out_dir    = OUT_DIR
@@ -526,14 +531,15 @@ def main():
     use_tid = TID_PATH is not None
 
     # Validate inputs early so errors are obvious
-    for label, path in [("CSV", CSV_PATH), ("Raster", RASTER_PATH)]:
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"{label} file not found: {path}")
+    if not os.path.isdir(CSV_FOLDER):
+        raise FileNotFoundError(f"CSV folder not found: {CSV_FOLDER}")
+    if not os.path.exists(RASTER_PATH):
+        raise FileNotFoundError(f"Raster file not found: {RASTER_PATH}")
     if use_tid and not os.path.exists(TID_PATH):
         raise FileNotFoundError(f"TID file not found: {TID_PATH}")
 
     # Load
-    gdf = load_csb(CSV_PATH)
+    gdf = load_csb(CSV_FOLDER)
 
     # Get reference raster values at each point
     print(f"[2/5] Sampling reference raster: {RASTER_PATH}")
@@ -565,7 +571,7 @@ def main():
 
 
     # Export
-    print(f"\nExporting results → {out_dir}")
+    print(f"\nExporting results → {OUT_DIR}")
     export_gpkg(gdf, gpkg_path)
     export_plots(gdf, plots_dir)
 

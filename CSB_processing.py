@@ -471,15 +471,21 @@ def plot_transit(grp: pd.DataFrame, transit_id: str, out_path: str) -> None:
     plt.tight_layout()
     plt.savefig(out_path, dpi=140, facecolor="white")
     plt.close(fig)
+
 def export_plots(gdf: gpd.GeoDataFrame, plots_dir: str) -> None:
     os.makedirs(plots_dir, exist_ok=True)
     transits = gdf["transit_id"].unique()
     print(f"  Exporting {len(transits)} transit plots → {plots_dir}")
     for tid in transits:
         grp = gdf[gdf["transit_id"] == tid].sort_values("time").copy().reset_index()
-        safe_tid = tid.replace("/", "_").replace(":", "-")
         try:
-            plot_transit(grp, tid, os.path.join(plots_dir, f"{safe_tid}.png"))
+            # better filenames for readability
+            vessel   = grp["platform_name"].iloc[0] if "platform_name" in grp.columns else "unknown"
+            t_start  = pd.to_datetime(grp["time"].iloc[0]).strftime("%Y%m%d_%H%M%S")
+            t_end    = pd.to_datetime(grp["time"].iloc[-1]).strftime("%Y%m%d_%H%M%S")
+            safe_vessel = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(vessel))
+            filename = f"{safe_vessel}_{t_start}_to_{t_end}.png"
+            plot_transit(grp, tid, os.path.join(plots_dir, filename))
         except Exception as e:
             print(f"    [warn] could not plot {tid}: {e}")
  

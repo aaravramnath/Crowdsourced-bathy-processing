@@ -421,12 +421,11 @@ def run_outlier_detection(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
 # Create Outlier Plots
 
 REASON_STYLE = {
-    "hard_reference_deviation": dict(color="#e63946", marker="s", s=20, zorder=5, label="Hard ref deviation"),
-    "bilateral_spike":          dict(color="#f4a261", marker="^", s=20, zorder=5, label="Bilateral spike"),
-    "smoothing_residual":       dict(color="#e9c46a", marker="o", s=12, zorder=4, label="Smoothing residual"),
-    "valid":                    dict(color="#457b9d", marker="o", s=4,  zorder=3, label="Valid"),
+    "hard_reference_deviation": dict(color="red",    marker="o", s=10, zorder=5, label="Hard ref deviation"),
+    "bilateral_spike":          dict(color="orange", marker="o", s=10, zorder=5, label="Bilateral spike"),
+    "smoothing_residual":       dict(color="orange", marker="o", s=10, zorder=4, label="Smoothing residual"),
+    "valid":                    dict(color="green",  marker="o", s=4,  zorder=3, label="Valid"),
 }
- 
  
 def plot_transit(grp: pd.DataFrame, transit_id: str, out_path: str) -> None:
     fig, ax = plt.subplots(figsize=(14, 6))

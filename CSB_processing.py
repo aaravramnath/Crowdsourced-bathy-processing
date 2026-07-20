@@ -52,6 +52,8 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from scipy.ndimage import uniform_filter1d
 from shapely.geometry import Point
+import tkinter as tk
+from tkinter import filedialog, messagebox
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -91,6 +93,55 @@ SMOOTH_PERCENTILE  = 98    # flag residuals above this percentile
 # TID values (inclusive-exclusive)
 DIRECT_TID_VALUES = set(range(10, 18))
 
+def pick_paths_via_gui() -> dict:
+    # use native file picker to select input/output paths
+    root = tk.Tk()
+    root.withdraw()   # hide the empty root window
+    root.attributes("-topmost", True)
+ 
+    print("Opening file manager - check terminal for prompt")
+ 
+    # CSV folder
+    print("Select folder containing CSB CSV files")
+    csv_folder = filedialog.askdirectory(title="Select folder containing CSB CSV files")
+    if not csv_folder:
+        raise SystemExit("No CSV folder selected — exiting.")
+ 
+    # Reference raster
+    print("Select reference bathymetry GeoTIFF")
+    raster_path = filedialog.askopenfilename(
+        title="Select reference bathymetry GeoTIFF",
+        filetypes=[("GeoTIFF", "*.tif *.tiff"), ("All files", "*.*")]
+    )
+    if not raster_path:
+        raise SystemExit("No reference raster selected — exiting.")
+ 
+    # TID raster (optional)
+    use_tid = messagebox.askyesno(
+        "TID Filter",
+        "Do you have a TID GeoTIFF and want to restrict\n"
+        "vessel offset calibration to direct-measurement cells only?"
+    )
+    tid_path = None
+    if use_tid:
+        print("Select TID GeoTIFF")
+        tid_path = filedialog.askopenfilename(
+            title="Select TID GeoTIFF",
+            filetypes=[("GeoTIFF", "*.tif *.tiff"), ("All files", "*.*")]
+        )
+        if not tid_path:
+            print("    [info] No TID file selected — TID filter disabled.")
+            tid_path = None
+ 
+    # Output folder
+    print("Select output folder (will be created if needed)")
+    out_dir = filedialog.askdirectory(title="Select output folder (will be created if needed)")
+    if not out_dir:
+        raise SystemExit("No output folder selected — exiting.")
+ 
+    root.destroy()
+    return dict(csv_folder=csv_folder, raster_path=raster_path,
+                tid_path=tid_path, out_dir=out_dir)
 
 # Load CSV + premliminary sanity checks
 
@@ -521,67 +572,59 @@ def export_gpkg(gdf: gpd.GeoDataFrame, out_path: str) -> None:
 # Main method
 
 def main():
-    # Edit these paths to point to your respective files/folders
-    CSV_FOLDER  = r"csv_data"           # folder with your csv files
-    RASTER_PATH = r"gebco_bathymetry.tif"
-    TID_PATH    = r"gebco_tid.tif"      # set to None to disable TID filter
-    OUT_DIR     = r"output"
-
-    out_dir    = OUT_DIR
-    plots_dir  = os.path.join(out_dir, "outlier_plots")
-    gpkg_path  = os.path.join(out_dir, "csb_processed_points.gpkg")
-    offset_csv = os.path.join(out_dir, "vessel_offsets.csv")
-    os.makedirs(out_dir, exist_ok=True)
-
+    # Pick files/folders via native OS dialogs
+    paths = pick_paths_via_gui()
+    CSV_FOLDER  = paths["csv_folder"]
+    RASTER_PATH = paths["raster_path"]
+    TID_PATH    = paths["tid_path"]
+    OUT_DIR     = paths["out_dir"]
+ 
+    plots_dir  = os.path.join(OUT_DIR, "outlier_plots")
+    gpkg_path  = os.path.join(OUT_DIR, "csb_processed_points.gpkg")
+    offset_csv = os.path.join(OUT_DIR, "vessel_offsets.csv")
+    os.makedirs(OUT_DIR, exist_ok=True)
+ 
     use_tid = TID_PATH is not None
-
-    # Validate inputs early so errors are obvious
-    if not os.path.isdir(CSV_FOLDER):
-        raise FileNotFoundError(f"CSV folder not found: {CSV_FOLDER}")
-    if not os.path.exists(RASTER_PATH):
-        raise FileNotFoundError(f"Raster file not found: {RASTER_PATH}")
-    if use_tid and not os.path.exists(TID_PATH):
-        raise FileNotFoundError(f"TID file not found: {TID_PATH}")
-
+ 
     # Load
     gdf = load_csb(CSV_FOLDER)
-
+ 
     # Get reference raster values at each point
     print(f"[2/5] Sampling reference raster: {RASTER_PATH}")
     gdf = sample_raster(gdf, RASTER_PATH, col_name="raster_val")
     gdf["has_reference"] = gdf["raster_val"].notna()
     n_ref = gdf["has_reference"].sum()
     print(f"    {n_ref:,}/{len(gdf):,} points have a reference raster value")
-
+ 
     if use_tid:
         print(f"    Sampling TID grid: {TID_PATH}")
         gdf = sample_tid(gdf, TID_PATH)
-
+ 
     # Derive offsets
     print(f"[3/5] Deriving per-vessel offsets (TID filter: {'ON' if use_tid else 'OFF'})")
     offsets, offset_stats = derive_vessel_offsets(gdf, use_tid_filter=use_tid)
     offset_stats.to_csv(offset_csv, index=False)
     print(f"    Offset stats saved: {offset_csv}")
-
+ 
     # Apply offsets
     print(f"[4/5] Applying offsets and assigning transit IDs")
     gdf = apply_offsets(gdf, offsets)
     gdf = assign_transit_ids(gdf)
     n_transits = gdf["transit_id"].nunique()
     print(f"    {n_transits:,} transit segments identified")
-
+ 
     # Detect Outliers
     print(f"[5/5] Running outlier detection")
     gdf = run_outlier_detection(gdf)
-
-
+ 
+ 
     # Export
     print(f"\nExporting results → {OUT_DIR}")
     export_gpkg(gdf, gpkg_path)
     export_plots(gdf, plots_dir)
-
+ 
     print("\nFinished processing")
-
-
+ 
+ 
 if __name__ == "__main__":
     main()

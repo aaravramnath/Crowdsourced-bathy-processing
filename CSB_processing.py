@@ -12,7 +12,7 @@ Processing
   1. Load & sanitise CSV
   2. Sample reference raster at each point
   3. Derive per-vessel systematic offset from reference (optional TID filter)
-  4. Apply offset  →  depth_corr  (positive, metres below surface)
+  4. Apply offset  →  depth  (positive, metres below surface)
   5. Outlier detection  (three independent layers, all non-destructive):
        a. Hard reference deviation  — immediate discard of extreme disagreements
        b. Bilateral median spike    — catches sounder glitches along-track
@@ -23,8 +23,7 @@ Processing
 Outputs
 
   csb_processed_points.gpkg:
-      depth_corr     corrected depth (positive, metres)
-      depth_raw      original CSV depth
+      depth          CSB depth (negative)
       raster_val     reference raster value at point location
       vessel_offset  per-vessel correction applied (0 if no reference)
       has_reference  True where a reference exists
@@ -65,21 +64,16 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # in the same vessel creates a new transit segment.
 TRANSIT_GAP_MINUTES = 60
 
-# Vessel offset limits: offsets outside this range are considered unreliable
-# and the vessel gets no correction (falls back to raw depth).
-OFFSET_MIN_M = -11.0   # don't correct by more than 11 m shallow
-OFFSET_MAX_M =  3.0    # don't correct by more than 3 m deep
-OFFSET_MIN_STD_M = 7.0 # discard offset if std dev of diffs exceeds this
+# Hard reference deviation thresholds (layer a):
+# Direct measurement cells
+HARD_DEV_FRACTION_DIRECT = 0.10   # 10% of depth
+HARD_DEV_MIN_M_DIRECT    = 5.0    # minimum absolute deviation to flag (metres)
+HARD_DEV_ABS_CAP_DIRECT  = 100.0  # always flag if deviation exceeds this (metres)
 
-# Hard reference deviation threshold (layer a):
-# Lower fraction to make more sensitive
-
-HARD_DEV_FRACTION = 0.20   # 20 % of depth
-HARD_DEV_MIN_M    = 10.0   # minimum absolute deviation to flag (metres)
-# Additionally, points where the absolute deviation exceeds this value are
-# immediately flagged regardless of fraction (catches near-zero dropouts
-# in deep water where 20% might be a very large number).
-HARD_DEV_ABS_CAP  = 200.0  # metres — always flag if deviation exceeds this
+# Indirect measurement cells
+HARD_DEV_FRACTION_INDIRECT = 0.30   # 30% of depth
+HARD_DEV_MIN_M_INDIRECT    = 20.0   # minimum absolute deviation to flag (metres)
+HARD_DEV_ABS_CAP_INDIRECT  = 400.0  # always flag if deviation exceeds this (metres)
 
 # Bilateral median spike detector (layer b):
 BILATERAL_WINDOW  = 7      # neighbours on each side
@@ -119,8 +113,7 @@ def pick_paths_via_gui() -> dict:
     # TID raster (optional)
     use_tid = messagebox.askyesno(
         "TID Filter",
-        "Do you have a TID GeoTIFF and want to restrict\n"
-        "vessel offset calibration to direct-measurement cells only?"
+        "Do you have a TID GeoTIFF for more accurate outlier detection on points with direct measurements?"
     )
     tid_path = None
     if use_tid:
@@ -135,7 +128,7 @@ def pick_paths_via_gui() -> dict:
  
     # Output folder
     print("Select output folder (will be created if needed)")
-    out_dir = filedialog.askdirectory(title="Select output folder (will be created if needed)")
+    out_dir = filedialog.askdirectory(title="Select output folder")
     if not out_dir:
         raise SystemExit("No output folder selected — exiting.")
  
@@ -257,60 +250,6 @@ def sample_tid(gdf: gpd.GeoDataFrame, tid_path: str) -> gpd.GeoDataFrame:
     return gdf
 
 
-# Vessel Offset Calculations
-
-def derive_vessel_offsets(gdf: gpd.GeoDataFrame,
-                          use_tid_filter: bool) -> dict:
-    ref = gdf.dropna(subset=["raster_val"]).copy()
-
-    if use_tid_filter:
-        before = len(ref)
-        ref = ref[ref["tid_value"].apply(
-            lambda t: int(t) in DIRECT_TID_VALUES if pd.notna(t) else False
-        )]
-        print(f"    TID filter: {len(ref):,}/{before:,} points on direct-measurement cells")
-
-    ref["diff"] = ref["depth"] - ref["raster_val"]
-    ref = ref[(ref["diff"] >= OFFSET_MIN_M) & (ref["diff"] <= OFFSET_MAX_M)]
-
-    offsets = {}
-    stats_rows = []
-
-    for uid, grp in ref.groupby("unique_id"):
-        mean_diff = grp["diff"].mean()
-        std_diff  = grp["diff"].std()
-        count     = len(grp)
-
-        if std_diff > OFFSET_MIN_STD_M or count < 5:
-            offset = 0.0
-            note = f"rejected (std={std_diff:.2f}, n={count})"
-        else:
-            offset = mean_diff
-            note = f"accepted (mean={mean_diff:.3f}m, std={std_diff:.2f}, n={count})"
-
-        offsets[uid] = offset
-        stats_rows.append({
-            "unique_id": uid,
-            "platform_name": grp["platform_name"].iloc[0],
-            "offset_m": offset,
-            "std_m": std_diff,
-            "n_points": count,
-            "note": note
-        })
-        print(f"    {uid[:40]:<40}  {note}")
-
-    return offsets, pd.DataFrame(stats_rows)
-
-
-# Apply Offsets
-
-def apply_offsets(gdf: gpd.GeoDataFrame, offsets: dict) -> gpd.GeoDataFrame:
-    gdf = gdf.copy()
-    gdf["vessel_offset"] = gdf["unique_id"].map(offsets).fillna(0.0)
-    gdf["depth_corr"] = gdf["depth"] - gdf["vessel_offset"]
-    gdf["depth_raw"]  = gdf["depth"]
-    return gdf
-
 
 def assign_transit_ids(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     gdf = gdf.copy()
@@ -331,23 +270,44 @@ def assign_transit_ids(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
 # Outlier Detection
 
 def flag_hard_reference_deviations(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    # Layer 1: Hard reference deviation 
+    """
+    Layer (a) — Hard reference deviation, split by TID confidence.
+    Direct cells (TID 10-17): tight threshold.
+    Indirect cells (TID 18+ or no TID): loose threshold.
+    """
     gdf = gdf.copy()
     mask_ref = gdf["has_reference"]
+    has_tid  = "tid_value" in gdf.columns
 
-    dev = np.abs(gdf.loc[mask_ref, "depth_corr"] - gdf.loc[mask_ref, "raster_val"])
-    proportional_thr = np.maximum(
-        HARD_DEV_MIN_M,
-        gdf.loc[mask_ref, "depth_corr"] * HARD_DEV_FRACTION
-    )
+    if has_tid:
+        direct_mask   = mask_ref & gdf["tid_value"].apply(
+            lambda t: pd.notna(t) and int(t) in DIRECT_TID_VALUES
+        )
+        indirect_mask = mask_ref & ~direct_mask
+    else:
+        direct_mask   = pd.Series(False, index=gdf.index)
+        indirect_mask = mask_ref
 
-    hard_flag = (dev > proportional_thr) | (dev > HARD_DEV_ABS_CAP)
-    flagged_idx = gdf.loc[mask_ref][hard_flag].index
+    flagged_total = 0
+    for mask, frac, min_m, cap, label in [
+        (direct_mask,   HARD_DEV_FRACTION_DIRECT,   HARD_DEV_MIN_M_DIRECT,
+                        HARD_DEV_ABS_CAP_DIRECT,   "direct"),
+        (indirect_mask, HARD_DEV_FRACTION_INDIRECT, HARD_DEV_MIN_M_INDIRECT,
+                        HARD_DEV_ABS_CAP_INDIRECT, "indirect"),
+    ]:
+        if not mask.any():
+            continue
+        dev = np.abs(gdf.loc[mask, "depth"] - gdf.loc[mask, "raster_val"])
+        thr = np.maximum(min_m, gdf.loc[mask, "depth"] * frac)
+        flag = (dev > thr) | (dev > cap)
+        flagged_idx = gdf.loc[mask][flag].index
+        gdf.loc[flagged_idx, "outlier"] = True
+        gdf.loc[flagged_idx, "outlier_reason"] = f"hard_ref_deviation_{label}"
+        count = flag.sum()
+        flagged_total += count
+        print(f"    Layer (a) hard ref deviation [{label:8s}]: {count:,} points flagged")
 
-    count = hard_flag.sum()
-    gdf.loc[flagged_idx, "outlier"] = True
-    gdf.loc[flagged_idx, "outlier_reason"] = "hard_reference_deviation"
-    print(f"    Layer (a) hard reference deviation: {count:,} points flagged")
+    print(f"    Layer (a) total: {flagged_total:,} points flagged")
     return gdf
 
 
@@ -357,7 +317,7 @@ def flag_bilateral_median_spikes(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     new_flags = 0
 
     for transit_id, grp in gdf.groupby("transit_id"):
-        depths_raw = grp["depth_corr"].values.astype(float)
+        depths_raw = grp["depth"].values.astype(float)
         depths = np.abs(depths_raw)
         n = len(depths)
         pre_flagged = grp["outlier"].values.copy()
@@ -418,7 +378,7 @@ def flag_smoothing_residuals(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
         if len(grp) < SMOOTH_FILTER_SIZE // 2:
             continue   # too short to smooth meaningfully
 
-        depths = grp["depth_corr"].values.astype(float)
+        depths = grp["depth"].values.astype(float)
 
         for _pass in range(2):
             flagged_mask = gdf.loc[grp.index, "outlier"].values
@@ -472,10 +432,11 @@ def run_outlier_detection(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
 # Create Outlier Plots
 
 REASON_STYLE = {
-    "hard_reference_deviation": dict(color="red",    marker="o", s=10, zorder=5, label="Hard ref deviation"),
-    "bilateral_spike":          dict(color="orange", marker="o", s=10, zorder=5, label="Bilateral spike"),
-    "smoothing_residual":       dict(color="orange", marker="o", s=10, zorder=4, label="Smoothing residual"),
-    "valid":                    dict(color="green",  marker="o", s=4,  zorder=3, label="Valid"),
+    "hard_ref_deviation_direct":   dict(color="red",    marker="o", s=10, zorder=5, label="Hard ref deviation (direct)"),
+    "hard_ref_deviation_indirect": dict(color="red",    marker="o", s=10, zorder=5, label="Hard ref deviation (indirect)"),
+    "bilateral_spike":             dict(color="orange", marker="o", s=10, zorder=5, label="Bilateral spike"),
+    "smoothing_residual":          dict(color="orange", marker="o", s=10, zorder=4, label="Smoothing residual"),
+    "valid":                       dict(color="green",  marker="o", s=4,  zorder=3, label="Valid"),
 }
  
 def plot_transit(grp: pd.DataFrame, transit_id: str, out_path: str) -> None:
@@ -489,7 +450,7 @@ def plot_transit(grp: pd.DataFrame, transit_id: str, out_path: str) -> None:
         spine.set_edgecolor("black")
  
     times = pd.to_datetime(grp["time"])
-    depth_display  = -grp["depth_corr"]
+    depth_display  = -grp["depth"]
     raster_display = -grp["raster_val"]
  
     # Valid points
@@ -544,8 +505,8 @@ def export_plots(gdf: gpd.GeoDataFrame, plots_dir: str) -> None:
 EXPORT_COLS = [
     "unique_id", "platform_name", "time",
     "lat", "lon",
-    "depth_raw", "depth_corr", "raster_val",
-    "vessel_offset", "has_reference",
+    "depth", "raster_val", "ref_difference",
+    "has_reference",
     "outlier", "outlier_reason",
     "transit_id", "geometry"
 ]
@@ -553,21 +514,31 @@ EXPORT_COLS = [
  
 def export_gpkg(gdf: gpd.GeoDataFrame, out_path: str) -> None:
     out = gdf[[c for c in EXPORT_COLS if c in gdf.columns]].copy()
- 
-    # Make negatives for convention
-    out["depth_corr"] = -out["depth_corr"]
-    out["depth_raw"]  = -out["depth_raw"]
+
+    # ref_difference: positive = CSB deeper than reference, negative = shallower
+    out["ref_difference"] = out["depth"] - out["raster_val"]
+    out.loc[~out["has_reference"], "ref_difference"] = np.nan
+
+    # make sure they are negative
+    out["depth"] = -out["depth"]
     out["raster_val"] = -out["raster_val"]
- 
+
     out["time"] = out["time"].astype(str)
     out.to_file(out_path, driver="GPKG")
- 
+
     n_valid   = (~out["outlier"]).sum()
     n_flagged = out["outlier"].sum()
     print(f"  GeoPackage saved: {out_path}")
     print(f"  {n_valid:,} valid  |  {n_flagged:,} flagged as outlier")
     for reason, count in out[out["outlier"]]["outlier_reason"].value_counts().items():
         print(f"    {reason}: {count:,}")
+
+    ref_diff = out["ref_difference"].dropna()
+    if len(ref_diff) > 0:
+        print(f"  CSB vs reference ({len(ref_diff):,} points with reference):")
+        print(f"    Mean difference (bias): {ref_diff.mean():.3f} m")
+        print(f"    Std deviation         : {ref_diff.std():.3f} m")
+        print(f"    Min / Max             : {ref_diff.min():.3f} / {ref_diff.max():.3f} m")
 
 # Main method
 
@@ -579,42 +550,38 @@ def main():
     TID_PATH    = paths["tid_path"]
     OUT_DIR     = paths["out_dir"]
  
-    plots_dir  = os.path.join(OUT_DIR, "outlier_plots")
-    gpkg_path  = os.path.join(OUT_DIR, "csb_processed_points.gpkg")
-    offset_csv = os.path.join(OUT_DIR, "vessel_offsets.csv")
+    plots_dir = os.path.join(OUT_DIR, "outlier_plots")
+    gpkg_path = os.path.join(OUT_DIR, "csb_processed_points.gpkg")
     os.makedirs(OUT_DIR, exist_ok=True)
- 
+
     use_tid = TID_PATH is not None
- 
+
     # Load
     gdf = load_csb(CSV_FOLDER)
- 
-    # Get reference raster values at each point
-    print(f"[2/5] Sampling reference raster: {RASTER_PATH}")
+
+    # Sample reference raster
+    print(f"[2/4] Sampling reference raster: {RASTER_PATH}")
     gdf = sample_raster(gdf, RASTER_PATH, col_name="raster_val")
     gdf["has_reference"] = gdf["raster_val"].notna()
     n_ref = gdf["has_reference"].sum()
     print(f"    {n_ref:,}/{len(gdf):,} points have a reference raster value")
- 
+
     if use_tid:
         print(f"    Sampling TID grid: {TID_PATH}")
         gdf = sample_tid(gdf, TID_PATH)
- 
-    # Derive offsets
-    print(f"[3/5] Deriving per-vessel offsets (TID filter: {'ON' if use_tid else 'OFF'})")
-    offsets, offset_stats = derive_vessel_offsets(gdf, use_tid_filter=use_tid)
-    offset_stats.to_csv(offset_csv, index=False)
-    print(f"    Offset stats saved: {offset_csv}")
- 
-    # Apply offsets
-    print(f"[4/5] Applying offsets and assigning transit IDs")
-    gdf = apply_offsets(gdf, offsets)
+        n_direct = gdf["tid_value"].apply(
+            lambda t: pd.notna(t) and int(t) in DIRECT_TID_VALUES
+        ).sum()
+        print(f"    {n_direct:,} points on direct-measurement cells (TID 10-17)")
+        print(f"    {n_ref - n_direct:,} points on indirect/predicted cells (TID 18+)")
+
+    # Prepare depths and segment transits
+    print(f"[3/4] Preparing depths and assigning transit IDs")
     gdf = assign_transit_ids(gdf)
-    n_transits = gdf["transit_id"].nunique()
-    print(f"    {n_transits:,} transit segments identified")
- 
-    # Detect Outliers
-    print(f"[5/5] Running outlier detection")
+    print(f"    {gdf['transit_id'].nunique():,} transit segments identified")
+
+    # Detect outliers
+    print(f"[4/4] Running outlier detection")
     gdf = run_outlier_detection(gdf)
  
  

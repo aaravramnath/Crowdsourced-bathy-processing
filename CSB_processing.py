@@ -67,18 +67,18 @@ TRANSIT_GAP_MINUTES = 60
 # Hard reference deviation thresholds (layer a):
 # Direct measurement cells
 HARD_DEV_FRACTION_DIRECT = 0.10   # 10% of depth
-HARD_DEV_MIN_M_DIRECT    = 5.0    # minimum absolute deviation to flag (metres)
-HARD_DEV_ABS_CAP_DIRECT  = 100.0  # always flag if deviation exceeds this (metres)
+HARD_DEV_MIN_M_DIRECT    = 5.0    # minimum absolute deviation to flag
+HARD_DEV_ABS_CAP_DIRECT  = 100.0  # always flag if deviation exceeds this
 
 # Indirect measurement cells
 HARD_DEV_FRACTION_INDIRECT = 0.30   # 30% of depth
-HARD_DEV_MIN_M_INDIRECT    = 20.0   # minimum absolute deviation to flag (metres)
-HARD_DEV_ABS_CAP_INDIRECT  = 400.0  # always flag if deviation exceeds this (metres)
+HARD_DEV_MIN_M_INDIRECT    = 20.0   # minimum absolute deviation to flag
+HARD_DEV_ABS_CAP_INDIRECT  = 400.0  # always flag if deviation exceeds this
 
 # Bilateral median spike detector (layer b):
 BILATERAL_WINDOW  = 7      # neighbours on each side
 BILATERAL_REL_THR = 0.08   # 8 % relative deviation (both sides must exceed)
-BILATERAL_MIN_DEPTH = 2.0  # skip points shallower than this (abs metres)
+BILATERAL_MIN_DEPTH = 2.0  # skip points shallower than this
 
 # Smoothing residual (layer c):
 SMOOTH_FILTER_SIZE = 50    # uniform filter window (pings)
@@ -432,11 +432,11 @@ def run_outlier_detection(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
 # Create Outlier Plots
 
 REASON_STYLE = {
-    "hard_ref_deviation_direct":   dict(color="red",    marker="o", s=10, zorder=5, label="Hard ref deviation (direct)"),
-    "hard_ref_deviation_indirect": dict(color="red",    marker="o", s=10, zorder=5, label="Hard ref deviation (indirect)"),
+    "hard_ref_deviation_direct":   dict(color="magenta",    marker="o", s=10, zorder=5, label="Hard ref deviation (direct)"),
+    "hard_ref_deviation_indirect": dict(color="magenta",    marker="o", s=10, zorder=5, label="Hard ref deviation (indirect)"),
     "bilateral_spike":             dict(color="orange", marker="o", s=10, zorder=5, label="Bilateral spike"),
     "smoothing_residual":          dict(color="orange", marker="o", s=10, zorder=4, label="Smoothing residual"),
-    "valid":                       dict(color="green",  marker="o", s=4,  zorder=3, label="Valid"),
+    "valid":                       dict(color="blue",  marker="o", s=4,  zorder=3, label="Valid"),
 }
  
 def plot_transit(grp: pd.DataFrame, transit_id: str, out_path: str) -> None:

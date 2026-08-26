@@ -53,7 +53,7 @@ REF_CAP_INDIRECT_SHALLOWER = 800.0  # Loose cap if CSB is shallower (allows for 
 # Bilateral spikes
 BILATERAL_WINDOW = 7      
 BILATERAL_REL_THR = 0.08   
-PLATEAU_MAX_PINGS = 15     # If depth jumps and stays flat for <= this many pings, flag as biological layer lock
+PLATEAU_MAX_PINGS = 15     # If depth jumps and stays flat for this many pings, flag as biological layer lock
 BILATERAL_MIN_DEPTH = 2.0  
 
 # SavGol Filter
@@ -63,9 +63,6 @@ SG_PERCENTILE = 98         # flag residuals above this percentile
 
 DIRECT_TID_VALUES = set(range(10, 18))
 
-# ==========================================
-# GUI & LOADING
-# ==========================================
 
 def pick_paths_via_gui() -> dict:
     root = tk.Tk()
@@ -95,8 +92,26 @@ def pick_paths_via_gui() -> dict:
     root.destroy()
     return dict(csv_folder=csv_folder, raster_path=raster_path, tid_path=tid_path, out_dir=out_dir)
 
+def _parse_date_only(series: pd.Series) -> pd.Series:
+    s = series.astype(str).str.strip().str.zfill(8)
+    if s.str.match(r"^\d{8}$").all():
+        # jumbled date with no separators, e.g. "25022024" -> 25-02-2024
+        return pd.to_datetime(s, format="%d%m%Y", errors="coerce")
+    return pd.to_datetime(series.astype(str).str.strip(), dayfirst=True, errors="coerce")
+
+
+def _parse_time_of_day(series: pd.Series) -> pd.Series:
+    s = series.astype(str).str.strip()
+    numeric = pd.to_numeric(s, errors="coerce")
+    if numeric.notna().all() and not s.str.contains(":").any():
+        # second of day, e.g. 43200 -> 12:00:00
+        return pd.to_timedelta(numeric, unit="s")
+    return pd.to_timedelta(s, errors="coerce")
+
+
 def _parse_single_csv(csv_path: str) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
+    df.columns = df.columns.str.strip().str.lower()
     required = {"lat", "lon", "depth"}
     if required - set(df.columns):
         raise ValueError(f"{os.path.basename(csv_path)}: missing columns")
@@ -105,8 +120,7 @@ def _parse_single_csv(csv_path: str) -> pd.DataFrame:
     time_col = next((c for c in df.columns if c.strip().lower().startswith("time")), None)
 
     if date_col and time_col and date_col != time_col:
-        combined = df[date_col].astype(str).str.strip() + " " + df[time_col].astype(str).str.strip()
-        df["time"] = pd.to_datetime(combined, dayfirst=True, errors="coerce")
+        df["time"] = _parse_date_only(df[date_col]) + _parse_time_of_day(df[time_col])
     elif "time" in df.columns:
         df["time"] = pd.to_datetime(df["time"], dayfirst=True, errors="coerce")
     
@@ -128,9 +142,7 @@ def load_csb(csv_folder: str) -> gpd.GeoDataFrame:
     df = pd.concat(frames, ignore_index=True).sort_values(["unique_id", "time"]).reset_index(drop=True)
     return gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df["lon"], df["lat"]), crs="EPSG:4326")
 
-# ==========================================
-# RASTER SAMPLING & TRANSITS
-# ==========================================
+# Raster sampling
 
 def sample_raster(gdf: gpd.GeoDataFrame, raster_path: str, col_name: str) -> gpd.GeoDataFrame:
     coords = [(geom.x, geom.y) for geom in gdf.geometry]
@@ -151,9 +163,7 @@ def assign_transit_ids(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
             gdf.loc[seg_grp.index, "transit_id"] = f"{uid}_T{int(seg_num):03d}"
     return gdf
 
-# ==========================================
-# OUTLIER DETECTION LAYERS
-# ==========================================
+# Outlier Detection Layers
 
 def haversine(lon1, lat1, lon2, lat2):
     R = 6371000  # radius of Earth in meters
@@ -319,9 +329,7 @@ def flag_layer3_savgol_residuals(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     return gdf
 
 
-# ==========================================
-# PLOTTING & EXPORT
-# ==========================================
+# Plotting + export
 
 REASON_STYLE = {
     "physical_gradient_exceeded":   dict(color="red",     marker="x", s=15, zorder=6, label="Layer 0: Physics"),
@@ -342,10 +350,18 @@ def export_plots(gdf: gpd.GeoDataFrame, plots_dir: str) -> None:
         
         times = pd.to_datetime(grp["time"])
         valid = grp[~grp["outlier"]]
-        ref = grp[grp["has_reference"]]
-        
+
+        has_tid = "tid_value" in grp.columns
+        if has_tid:
+            ref_direct = grp[grp["has_reference"] & grp["tid_value"].apply(lambda t: pd.notna(t) and int(t) in DIRECT_TID_VALUES)]
+            ref_indirect = grp[grp["has_reference"] & ~grp["tid_value"].apply(lambda t: pd.notna(t) and int(t) in DIRECT_TID_VALUES)]
+        else:
+            ref_direct = grp.iloc[0:0]
+            ref_indirect = grp[grp["has_reference"]]
+
         if not valid.empty: ax.scatter(times[valid.index], -valid["depth"], color="blue", s=4, zorder=3, label="Valid")
-        if not ref.empty: ax.scatter(times[ref.index], -ref["raster_val"], color="black", s=4, zorder=2, label="Reference")
+        if not ref_direct.empty: ax.scatter(times[ref_direct.index], -ref_direct["raster_val"], color="black", s=4, zorder=2, label="Reference (direct)")
+        if not ref_indirect.empty: ax.scatter(times[ref_indirect.index], -ref_indirect["raster_val"], color="gray", s=4, zorder=2, label="Reference (indirect)")
         
         for reason, style in REASON_STYLE.items():
             sub = grp[grp["outlier_reason"] == reason]

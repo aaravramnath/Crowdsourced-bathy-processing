@@ -345,7 +345,7 @@ REASON_STYLE = {
     "hard_ref_direct":              dict(color="magenta", marker="o", s=10, zorder=5, label="Layer 1: Ref Direct"),
     "hard_ref_indirect_asymmetric": dict(color="purple",  marker="o", s=10, zorder=5, label="Layer 1: Ref Indirect"),
     "spike_or_plateau":             dict(color="orange",  marker="o", s=10, zorder=4, label="Layer 2: Spike/Plateau"),
-    "savgol_residual":              dict(color="gold",    marker="o", s=10, zorder=4, label="Layer 3: SavGol Res"),
+    "savgol_residual":              dict(color="brown",    marker="o", s=10, zorder=4, label="Layer 3: SavGol Res"),
 }
 
 def export_plots(gdf: gpd.GeoDataFrame, plots_dir: str) -> None:
@@ -382,7 +382,9 @@ def export_plots(gdf: gpd.GeoDataFrame, plots_dir: str) -> None:
         fig.autofmt_xdate(rotation=25, ha="right")
         
         vessel = "".join(c if c.isalnum() else "_" for c in str(grp["platform_name"].iloc[0]))
-        plt.savefig(os.path.join(plots_dir, f"{vessel}_{tid}.png"), dpi=140, facecolor="white")
+        t_start = times.iloc[0].strftime("%Y%m%dT%H%M%S")
+        t_end = times.iloc[-1].strftime("%Y%m%dT%H%M%S")
+        plt.savefig(os.path.join(plots_dir, f"{vessel}_{tid}_{t_start}_{t_end}.png"), dpi=140, facecolor="white")
         plt.close(fig)
 
 def main():

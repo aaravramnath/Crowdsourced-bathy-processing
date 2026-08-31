@@ -9,7 +9,7 @@ Inputs:
   - Optional TID GeoTIFF          (restrict to only direct-measurement cells)
 
 Output variables:
-    - depth: identical to provided depth but always negative for usability within GEBCO grid
+    - depth: identical to provided depth but always negative for usability within larger bathymetry grid
     - raster_val: sampled reference bathymetry (negative)
     - has_reference: boolean indicating if raster_val is valid
     - tid_value: sampled TID value (if provided)
@@ -115,6 +115,11 @@ def _parse_time_of_day(series: pd.Series) -> pd.Series:
     if numeric.notna().all() and not s.str.contains(":").any():
         # second of day, e.g. 43200 -> 12:00:00
         return pd.to_timedelta(numeric, unit="s")
+    if s.str.contains(r"(?i)\s*[ap]\.?m\.?\s*$", regex=True).any():
+        # 12-hour clock with AM/PM suffix — pd.to_timedelta silently ignores
+        # the AM/PM marker, so parse as a datetime and take the time-of-day part
+        dt = pd.to_datetime(s, errors="coerce")
+        return dt - dt.dt.normalize()
     return pd.to_timedelta(s, errors="coerce")
 
 

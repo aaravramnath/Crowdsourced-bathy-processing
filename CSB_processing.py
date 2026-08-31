@@ -7,6 +7,15 @@ Inputs:
   - CSB CSV file  (columns: unique_id, platform_name, time, lat, lon, depth)
   - Reference bathymetry GeoTIFF  (with negative depth values)
   - Optional TID GeoTIFF          (restrict to only direct-measurement cells)
+
+Output variables:
+    - depth: identical to provided depth but always negative for usability within GEBCO grid
+    - raster_val: sampled reference bathymetry (negative)
+    - has_reference: boolean indicating if raster_val is valid
+    - tid_value: sampled TID value (if provided)
+    - transit_id: unique identifier for each continuous transit segment (represented in output plots)
+    - outlier: boolean indicating if point was flagged as an outlier
+    - outlier_reason: string indicating which layer flagged the point
 """
 
 import os
@@ -29,16 +38,16 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
 
-# Tunable parameters
+# Tunable parameters (see CSB Processing SOP for details, section references below)
 
-# Transit splitting
+# Transit splitting (4.II.B.5.a)
 TRANSIT_GAP_MINUTES = 60
 
-# Physical gradient check
+# Physical gradient check (4.II.B.1)
 # Max allowable physical slope between consecutive pings (in degrees)
 MAX_SLOPE_DEG = 60.0  
 
-# Asymmetric reference thresolds
+# Asymmetric reference thresolds (4.II.B.2)
 # Dir. measurement cells
 REF_FRAC_DIRECT = 0.10   
 REF_MIN_M_DIRECT = 5.0    
@@ -50,18 +59,18 @@ REF_MIN_M_INDIRECT = 20.0
 REF_CAP_INDIRECT_DEEPER = 150.0     # Tight cap if CSB is deeper (likely bottom loss/noise)
 REF_CAP_INDIRECT_SHALLOWER = 800.0  # Loose cap if CSB is shallower (allows for uncharted seamounts)
 
-# Bilateral spikes
+# Bilateral spikes and biological scattering layer detection (4.II.B.3)
 BILATERAL_WINDOW = 7      
 BILATERAL_REL_THR = 0.08   
 PLATEAU_MAX_PINGS = 15     # If depth jumps and stays flat for this many pings, flag as biological layer lock
 BILATERAL_MIN_DEPTH = 2.0  
 
-# SavGol Filter
+# SavGol Filter (4.II.B.4)
 SG_WINDOW_SIZE = 51        # Must be an odd number
 SG_POLY_ORDER = 2          # 2nd order polynomial to preserve peaks
 SG_PERCENTILE = 98         # flag residuals above this percentile
 
-DIRECT_TID_VALUES = set(range(10, 18))
+DIRECT_TID_VALUES = set(range(10, 18)) # 4.II.B.5.b
 
 
 def pick_paths_via_gui() -> dict:

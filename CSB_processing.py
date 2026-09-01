@@ -68,7 +68,7 @@ BILATERAL_MIN_DEPTH = 2.0
 # SavGol Filter (4.II.B.4)
 SG_WINDOW_SIZE = 51        # Must be an odd number
 SG_POLY_ORDER = 2          # 2nd order polynomial to preserve peaks
-SG_PERCENTILE = 98         # flag residuals above this percentile
+SG_SIGMA_K = 4.0             # flag residuals more than this many robust-sigma above the median
 
 DIRECT_TID_VALUES = set(range(10, 18)) # 4.II.B.5.b
 
@@ -330,8 +330,13 @@ def flag_layer3_savgol_residuals(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
         
         valid_res = residuals[~flagged_mask]
         if len(valid_res) == 0: continue
-        
-        threshold = np.percentile(valid_res, SG_PERCENTILE)
+
+        # Robust (MAD-based) absolute threshold, so a clean transit can
+        # legitimately flag zero points instead of always flagging a fixed
+        # top-percentile of its own residual distribution.
+        med = np.median(valid_res)
+        mad = np.median(np.abs(valid_res - med)) * 1.4826
+        threshold = np.inf if mad < 1e-6 else med + SG_SIGMA_K * mad
         new_outlier = (residuals > threshold) & (~flagged_mask)
         
         idx = grp.index[new_outlier]
@@ -350,7 +355,7 @@ REASON_STYLE = {
     "hard_ref_direct":              dict(color="magenta", marker="o", s=10, zorder=5, label="Layer 1: Ref Direct"),
     "hard_ref_indirect_asymmetric": dict(color="purple",  marker="o", s=10, zorder=5, label="Layer 1: Ref Indirect"),
     "spike_or_plateau":             dict(color="orange",  marker="o", s=10, zorder=4, label="Layer 2: Spike/Plateau"),
-    "savgol_residual":              dict(color="brown",    marker="o", s=10, zorder=4, label="Layer 3: SavGol Res"),
+    "savgol_residual":              dict(color="cyan",    marker="o", s=10, zorder=4, label="Layer 3: SavGol Res"),
 }
 
 def export_plots(gdf: gpd.GeoDataFrame, plots_dir: str) -> None:

@@ -430,6 +430,12 @@ def main():
     out["raster_val"] = -out["raster_val"]
     out["time"] = out["time"].astype(str)
     out.to_file(os.path.join(OUT_DIR, "csb_processed.gpkg"), driver="GPKG")
+
+    # Export CSVs (same attributes as GPKG, minus geometry)
+    out_csv = out.drop(columns="geometry")
+    out_csv.to_csv(os.path.join(OUT_DIR, "csb_processed.csv"), index=False)
+    out_csv[~out_csv["outlier"]].to_csv(os.path.join(OUT_DIR, "csb_processed_no_outliers.csv"), index=False)
+
     print("Processing Complete.")
 
 if __name__ == "__main__":

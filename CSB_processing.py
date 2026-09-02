@@ -79,9 +79,11 @@ def pick_paths_via_gui() -> dict:
     root.attributes("-topmost", True)
  
     print("Opening file manager - check terminal for prompt")
+    print("Select folder containing CSB CSV files")
     csv_folder = filedialog.askdirectory(title="Select folder containing CSB CSV files")
     if not csv_folder: raise SystemExit("No CSV folder selected — exiting.")
- 
+
+    print("Select reference bathymetry GeoTIFF")
     raster_path = filedialog.askopenfilename(
         title="Select reference bathymetry GeoTIFF",
         filetypes=[("GeoTIFF", "*.tif *.tiff"), ("All files", "*.*")]
@@ -91,10 +93,12 @@ def pick_paths_via_gui() -> dict:
     use_tid = messagebox.askyesno("TID Filter", "Do you have a TID GeoTIFF for direct measurements?")
     tid_path = None
     if use_tid:
+        print("Select TID GeoTIFF")
         tid_path = filedialog.askopenfilename(
             title="Select TID GeoTIFF", filetypes=[("GeoTIFF", "*.tif *.tiff"), ("All files", "*.*")]
         )
- 
+
+    print("Select output folder")
     out_dir = filedialog.askdirectory(title="Select output folder")
     if not out_dir: raise SystemExit("No output folder selected — exiting.")
  

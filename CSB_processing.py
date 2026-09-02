@@ -77,7 +77,8 @@ def pick_paths_via_gui() -> dict:
     root = tk.Tk()
     root.withdraw()
     root.attributes("-topmost", True)
- 
+    root.update_idletasks()
+
     print("Opening file manager - check terminal for prompt")
     print("Select folder containing CSB CSV files")
     csv_folder = filedialog.askdirectory(title="Select folder containing CSB CSV files")
